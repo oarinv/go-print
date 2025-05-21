@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"fmt"
 	"net"
-	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -12,30 +11,27 @@ import (
 )
 
 const (
-	// SMB 默认端口
 	smbPort = 445
-	// 超时设置
 	timeout = 3 * time.Second
 )
 
 type Printer struct {
-	IP      string
-	Name    string
-	Comment string
+	IP        string
+	Name      string
+	ShareName string
+	FullPath  string
 }
 
-// InterfaceInfo 存储网络接口信息
 type InterfaceInfo struct {
 	Name string
 	IP   string
 	CIDR string
 }
 
-// getLocalInterfaces 获取所有网络接口的 IP 和 CIDR
 func getLocalInterfaces() ([]InterfaceInfo, error) {
 	interfaces, err := net.Interfaces()
 	if err != nil {
-		return nil, fmt.Errorf("获取网络接口失败: %v", err)
+		return nil, fmt.Errorf("获取网络接口失败")
 	}
 
 	var result []InterfaceInfo
@@ -69,7 +65,6 @@ func getLocalInterfaces() ([]InterfaceInfo, error) {
 	return result, nil
 }
 
-// selectInterface 选择 WLAN 或以太网接口
 func selectInterface(interfaces []InterfaceInfo) (InterfaceInfo, error) {
 	for _, iface := range interfaces {
 		nameLower := strings.ToLower(iface.Name)
@@ -93,17 +88,23 @@ func selectInterface(interfaces []InterfaceInfo) (InterfaceInfo, error) {
 	return interfaces[choice], nil
 }
 
-// scanNetwork 扫描局域网内的设备（限定为 192.168.0.100-110）
-func scanNetwork(cidr string) ([]string, error) {
-	// 忽略 CIDR，固定扫描 192.168.0.100-110
+func getNetworkRange(cidr string) ([]string, error) {
+	ip, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return nil, err
+	}
+
 	var ips []string
-	for i := 100; i <= 110; i++ {
-		ips = append(ips, fmt.Sprintf("192.168.0.%d", i))
+	for ip := ip.Mask(ipnet.Mask); ipnet.Contains(ip); incIP(ip) {
+		ips = append(ips, ip.String())
+	}
+
+	if len(ips) > 2 {
+		return ips[1 : len(ips)-1], nil
 	}
 	return ips, nil
 }
 
-// incIP 增加 IP 地址
 func incIP(ip net.IP) {
 	for j := len(ip) - 1; j >= 0; j-- {
 		ip[j]++
@@ -113,12 +114,11 @@ func incIP(ip net.IP) {
 	}
 }
 
-// getShares 使用 net view 命令获取目标设备的共享列表
 func getShares(ip string) ([]string, error) {
 	cmd := exec.Command("net", "view", fmt.Sprintf("\\\\%s", ip))
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return nil, fmt.Errorf("执行 net view \\\\%s 失败: %v, 输出: %s", ip, err, string(output))
+		return nil, fmt.Errorf("执行 net view 失败")
 	}
 
 	var shares []string
@@ -126,9 +126,9 @@ func getShares(ip string) ([]string, error) {
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.Contains(line, "Print") {
-			fields := strings.Fields(line)
-			if len(fields) > 0 {
-				shareName := fields[0]
+			printIndex := strings.Index(line, "Print")
+			if printIndex > 0 {
+				shareName := strings.TrimSpace(line[:printIndex])
 				if shareName != "" && !strings.Contains(strings.ToLower(shareName), "ipc$") {
 					shares = append(shares, shareName)
 				}
@@ -142,150 +142,118 @@ func getShares(ip string) ([]string, error) {
 	return shares, nil
 }
 
-// checkWMIC 检查 wmic 是否可用
-func checkWMIC() error {
-	cmd := exec.Command("wmic", "path", "win32_printer", "get", "Name")
+func isWindows7OrEarlier() bool {
+	cmd := exec.Command("cmd", "/c", "ver")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("wmic 不可用: %v, 输出: %s", err, string(output))
+		return false
+	}
+	return strings.Contains(string(output), "6.1") || strings.Contains(string(output), "6.0")
+}
+
+func connectPrinter(printer Printer) error {
+	cmd := exec.Command("rundll32.exe", "printui.dll,PrintUIEntry", "/ga", "/n", printer.FullPath)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("连接打印机失败")
 	}
 	return nil
 }
 
-// setDefaultPrinter 使用 wmic 或 PowerShell 设置默认打印机
-func setDefaultPrinter(shareName string) error {
-	// 优先尝试 wmic
-	if err := checkWMIC(); err == nil {
-		cmd := exec.Command("wmic", "printer", "where", fmt.Sprintf("Name='%s'", shareName), "call", "setdefaultprinter")
-		output, err := cmd.CombinedOutput()
-		if err == nil {
-			fmt.Printf("成功使用 wmic 设置 %s 为默认打印机\n", shareName)
-			return nil
-		}
-		fmt.Printf("wmic 设置默认打印机 %s 失败: %v, 输出: %s\n", shareName, err, string(output))
-	} else {
-		fmt.Printf("wmic 不可用: %v\n", err)
+func setDefaultPrinter(printer Printer) error {
+	if err := connectPrinter(printer); err != nil {
+		return err
 	}
 
-	// 后备使用 PowerShell（Windows 11 支持）
-	cmd := exec.Command("powershell", "-Command", fmt.Sprintf(`Set-Printer -Name "%s"`, shareName))
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("PowerShell 设置默认打印机 %s 失败: %v, 输出: %s", shareName, err, string(output))
+	if isWindows7OrEarlier() {
+		cmd := exec.Command("wmic", "printer", "where", fmt.Sprintf("Name='%s'", printer.FullPath), "call", "setdefaultprinter")
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("设置默认打印机失败")
+		}
+	} else {
+		cmd := exec.Command("powershell", "-Command", fmt.Sprintf(`Set-Printer -Name "%s" -AsDefault`, printer.FullPath))
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("设置默认打印机失败")
+		}
 	}
-	fmt.Printf("成功使用 PowerShell 设置 %s 为默认打印机\n", shareName)
 	return nil
 }
 
 func main() {
-	fmt.Println("开始获取本地 IP 并扫描局域网中的共享打印机...")
+	fmt.Println("开始扫描局域网中的共享打印机...")
 
-	// 检查 wmic.exe 是否存在
-	if _, err := os.Stat(`C:\Windows\System32\wbem\wmic.exe`); os.IsNotExist(err) {
-		fmt.Println("警告：wmic.exe 不存在于 C:\\Windows\\System32\\wbem，请检查系统文件或 PATH 环境变量")
-		fmt.Println("建议：运行 'sfc /scannow' 修复系统文件，或以管理员身份运行程序")
-		fmt.Println("将依赖 PowerShell 设置默认打印机")
-	}
-
-	// 获取所有网络接口
 	interfaces, err := getLocalInterfaces()
 	if err != nil {
-		fmt.Printf("获取网络接口失败: %v\n", err)
+		fmt.Println("获取网络接口失败")
 		return
 	}
 
-	// 选择接口
 	selectedInterface, err := selectInterface(interfaces)
 	if err != nil {
-		fmt.Printf("选择接口失败: %v\n", err)
+		fmt.Println("选择接口失败")
 		return
 	}
-	fmt.Printf("使用接口: %s, IP: %s, CIDR: %s\n", selectedInterface.Name, selectedInterface.IP, selectedInterface.CIDR)
 
-	// 验证 CIDR 是否为 192.168.0.0/24
-	if !strings.HasPrefix(selectedInterface.CIDR, "192.168.0.") {
-		fmt.Println("警告：选定的 CIDR 不是 192.168.0.0/24，是否继续？(y/n)")
-		var response string
-		fmt.Scan(&response)
-		if strings.ToLower(response) != "y" {
-			fmt.Println("程序退出")
-			return
-		}
-	}
-
-	// 获取局域网 IP 列表
-	ips, err := scanNetwork(selectedInterface.CIDR)
+	ips, err := getNetworkRange(selectedInterface.CIDR)
 	if err != nil {
-		fmt.Printf("扫描网络失败: %v\n", err)
+		fmt.Println("获取网络范围失败")
 		return
 	}
 
 	var wg sync.WaitGroup
 	printers := make(chan Printer, len(ips))
 
-	// 并发扫描
 	for _, ip := range ips {
 		wg.Add(1)
 		go func(ip string) {
 			defer wg.Done()
-			// 检查 TCP 连接
 			conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ip, smbPort), timeout)
 			if err != nil {
-				fmt.Printf("IP %s: TCP 连接失败: %v\n", ip, err)
 				return
 			}
 			conn.Close()
 
-			// 获取共享列表
 			shareNames, err := getShares(ip)
 			if err != nil {
-				fmt.Printf("IP %s: 获取共享列表失败: %v\n", ip, err)
 				return
 			}
 
-			// 记录发现的打印机
 			for _, shareName := range shareNames {
-				fmt.Printf("IP %s: 发现打印机共享 %s\n", ip, shareName)
+				fullPath := fmt.Sprintf("\\\\%s\\%s", ip, shareName)
 				printers <- Printer{
-					IP:      ip,
-					Name:    shareName,
-					Comment: "Detected SMB Printer Share",
+					IP:        ip,
+					Name:      shareName,
+					ShareName: shareName,
+					FullPath:  fullPath,
 				}
 			}
 		}(ip)
 	}
 
-	// 等待所有扫描完成
 	go func() {
 		wg.Wait()
 		close(printers)
 	}()
 
-	// 收集结果
-	foundPrinters := []Printer{}
+	var targetPrinter *Printer
 	for printer := range printers {
-		foundPrinters = append(foundPrinters, printer)
+		fmt.Printf("发现打印机: %s (%s)\n", printer.FullPath, printer.IP)
+		if targetPrinter == nil {
+			targetPrinter = &printer
+		}
 	}
 
-	// 输出结果
-	if len(foundPrinters) == 0 {
-		fmt.Println("未找到共享打印机")
+	if targetPrinter == nil {
+		fmt.Println("未找到任何共享打印机")
 		return
 	}
 
-	fmt.Println("发现以下共享打印机：")
-	for _, printer := range foundPrinters {
-		fmt.Printf("IP: %s, 名称: %s, 备注: %s\n", printer.IP, printer.Name, printer.Comment)
+	fmt.Printf("自动选择打印机: %s\n", targetPrinter.FullPath)
+	fmt.Println("正在设置默认打印机...")
+
+	if err := setDefaultPrinter(*targetPrinter); err != nil {
+		fmt.Println("设置默认打印机失败:", err)
+		return
 	}
 
-	// 设置默认打印机
-	for _, printer := range foundPrinters {
-		if strings.Contains(strings.ToLower(printer.Name), "brother hl-2140 series") {
-			err := setDefaultPrinter(printer.Name)
-			if err != nil {
-				fmt.Printf("设置默认打印机失败: %v\n", err)
-			}
-			break
-		}
-	}
+	fmt.Printf("成功设置 %s 为默认打印机\n", targetPrinter.FullPath)
 }
