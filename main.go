@@ -66,26 +66,11 @@ func getLocalInterfaces() ([]InterfaceInfo, error) {
 }
 
 func selectInterface(interfaces []InterfaceInfo) (InterfaceInfo, error) {
-	for _, iface := range interfaces {
-		nameLower := strings.ToLower(iface.Name)
-		if strings.Contains(nameLower, "wlan") || strings.Contains(nameLower, "ethernet") || strings.Contains(nameLower, "eth") {
-			return iface, nil
-		}
+	if len(interfaces) > 0 {
+		fmt.Printf("自动选择网络接口: %s (IP: %s)\n", interfaces[0].Name, interfaces[0].IP)
+		return interfaces[0], nil
 	}
-
-	fmt.Println("未找到 WLAN 或以太网接口，请手动选择：")
-	for i, iface := range interfaces {
-		fmt.Printf("[%d] 接口: %s, IP: %s, CIDR: %s\n", i, iface.Name, iface.IP, iface.CIDR)
-	}
-
-	var choice int
-	fmt.Print("请输入接口编号 (0, 1, ...): ")
-	_, err := fmt.Scan(&choice)
-	if err != nil || choice < 0 || choice >= len(interfaces) {
-		return InterfaceInfo{}, fmt.Errorf("无效的选择")
-	}
-
-	return interfaces[choice], nil
+	return InterfaceInfo{}, fmt.Errorf("没有可用的网络接口")
 }
 
 func getNetworkRange(cidr string) ([]string, error) {
@@ -142,39 +127,43 @@ func getShares(ip string) ([]string, error) {
 	return shares, nil
 }
 
-func isWindows7OrEarlier() bool {
-	cmd := exec.Command("cmd", "/c", "ver")
+func isPrinterConnected(printerName string) bool {
+	cmd := exec.Command("powershell", "-Command", fmt.Sprintf(`Get-Printer -Name "%s" -ErrorAction SilentlyContinue | Measure-Object | Select-Object -ExpandProperty Count`, printerName))
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return false
 	}
-	return strings.Contains(string(output), "6.1") || strings.Contains(string(output), "6.0")
+	return strings.TrimSpace(string(output)) == "1"
 }
 
 func connectPrinter(printer Printer) error {
-	cmd := exec.Command("rundll32.exe", "printui.dll,PrintUIEntry", "/ga", "/n", printer.FullPath)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("连接打印机失败")
+	if isPrinterConnected(printer.FullPath) {
+		fmt.Printf("打印机 %s 已连接，跳过连接步骤\n", printer.FullPath)
+		return nil
 	}
+
+	// 添加网络打印机
+	addCmd := exec.Command("rundll32.exe", "printui.dll,PrintUIEntry", "/in", "/n", printer.FullPath)
+	if err := addCmd.Run(); err != nil {
+		return fmt.Errorf("添加打印机失败: %v", err)
+	}
+
 	return nil
 }
 
 func setDefaultPrinter(printer Printer) error {
-	if err := connectPrinter(printer); err != nil {
-		return err
+	cmd := exec.Command("rundll32.exe", "printui.dll,PrintUIEntry", "/y", "/n", printer.FullPath)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("设置默认打印机失败: %v", err)
 	}
 
-	if isWindows7OrEarlier() {
-		cmd := exec.Command("wmic", "printer", "where", fmt.Sprintf("Name='%s'", printer.FullPath), "call", "setdefaultprinter")
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("设置默认打印机失败")
-		}
-	} else {
-		cmd := exec.Command("powershell", "-Command", fmt.Sprintf(`Set-Printer -Name "%s" -AsDefault`, printer.FullPath))
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("设置默认打印机失败")
-		}
+	// 验证是否设置成功
+	checkCmd := exec.Command("powershell", "-Command", fmt.Sprintf(`(Get-Printer -Name "%s").IsDefault`, printer.FullPath))
+	output, err := checkCmd.CombinedOutput()
+	if err != nil || !strings.Contains(string(output), "True") {
+		return fmt.Errorf("验证默认打印机设置失败")
 	}
+
 	return nil
 }
 
@@ -183,19 +172,19 @@ func main() {
 
 	interfaces, err := getLocalInterfaces()
 	if err != nil {
-		fmt.Println("获取网络接口失败")
+		fmt.Println("获取网络接口失败:", err)
 		return
 	}
 
 	selectedInterface, err := selectInterface(interfaces)
 	if err != nil {
-		fmt.Println("选择接口失败")
+		fmt.Println("选择接口失败:", err)
 		return
 	}
 
 	ips, err := getNetworkRange(selectedInterface.CIDR)
 	if err != nil {
-		fmt.Println("获取网络范围失败")
+		fmt.Println("获取网络范围失败:", err)
 		return
 	}
 
@@ -248,8 +237,13 @@ func main() {
 	}
 
 	fmt.Printf("自动选择打印机: %s\n", targetPrinter.FullPath)
-	fmt.Println("正在设置默认打印机...")
+	
+	if err := connectPrinter(*targetPrinter); err != nil {
+		fmt.Println("打印机连接失败:", err)
+		return
+	}
 
+	fmt.Println("正在设置默认打印机...")
 	if err := setDefaultPrinter(*targetPrinter); err != nil {
 		fmt.Println("设置默认打印机失败:", err)
 		return
