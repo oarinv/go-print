@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -13,6 +14,11 @@ import (
 const (
 	smbPort = 445             // SMB 协议默认端口
 	timeout = 3 * time.Second // TCP 连接超时时间
+)
+
+const (
+	minHost = 100 // 起始主机号
+	maxHost = 110 // 结束主机号
 )
 
 // 打印机信息结构体
@@ -85,14 +91,21 @@ func getNetworkRange(cidr string) ([]string, error) {
 		return nil, err
 	}
 
-	var ips []string
-	for ip := ip.Mask(ipnet.Mask); ipnet.Contains(ip); incIP(ip) {
-		ips = append(ips, ip.String())
+	baseIP := ip.Mask(ipnet.Mask).To4()
+	if baseIP == nil {
+		return nil, fmt.Errorf("无效的 IPv4 网段")
 	}
 
-	// 去除网络地址和广播地址
-	if len(ips) > 2 {
-		return ips[1 : len(ips)-1], nil
+	var ips []string
+	for i := minHost; i <= maxHost; i++ {
+		candidate := net.IPv4(baseIP[0], baseIP[1], baseIP[2], byte(i))
+		if ipnet.Contains(candidate) {
+			ips = append(ips, candidate.String())
+		}
+	}
+
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("指定范围 (%d-%d) 内无可用 IP", minHost, maxHost)
 	}
 	return ips, nil
 }
@@ -182,6 +195,11 @@ func setDefaultPrinter(printer Printer) error {
 
 // 主程序入口
 func main() {
+	defer func() {
+		fmt.Println("\n按回车键退出...")
+		bufio.NewReader(os.Stdin).ReadBytes('\n')
+	}()
+
 	fmt.Println("开始扫描局域网中的共享打印机...")
 
 	interfaces, err := getLocalInterfaces()
