@@ -23,3 +23,7 @@ func connectPrinter(printer Printer) error {
         "/in", "/n", printer.FullPath)
     return cmd.Run()
 }
+```
+
+## 协议许可
+本项目基于 MIT License 开源发布。
