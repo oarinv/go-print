@@ -195,6 +195,7 @@ func setDefaultPrinter(printer Printer) error {
 
 // 主程序入口
 func main() {
+	// 等待用户按下任意键退出
 	defer func() {
 		fmt.Println("\n按回车键退出...")
 		bufio.NewReader(os.Stdin).ReadBytes('\n')
