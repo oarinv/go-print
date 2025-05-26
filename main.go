@@ -176,20 +176,12 @@ func connectPrinter(printer Printer) error {
 	return nil
 }
 
-// 设置默认打印机
+// 设置默认打印机（不进行验证）
 func setDefaultPrinter(printer Printer) error {
 	cmd := exec.Command("rundll32.exe", "printui.dll,PrintUIEntry", "/y", "/n", printer.FullPath)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("设置默认打印机失败: %v", err)
 	}
-
-	// 验证默认打印机设置是否成功
-	checkCmd := exec.Command("powershell", "-Command", fmt.Sprintf(`(Get-Printer -Name "%s").IsDefault`, printer.FullPath))
-	output, err := checkCmd.CombinedOutput()
-	if err != nil || !strings.Contains(string(output), "True") {
-		return fmt.Errorf("验证默认打印机设置失败")
-	}
-
 	return nil
 }
 
